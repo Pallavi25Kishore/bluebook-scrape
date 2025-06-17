@@ -1,4 +1,59 @@
-"""scraper for Bluebook content - india chapter"""
+"""Sequential order scraper that preserves exact page flow"""
+
+"""
+BLUEBOOK SCRAPER JSON SCHEMA
+
+{
+  "document": {
+    "title": "India",                    // Document title
+    "subtitle": "(Common Law)",          // Document subtitle
+    "number": "T2.18",                   // Table number
+    "scraped_at": "ISO_TIMESTAMP",       // When scraped
+    "source_url": "https://...",         // Original URL
+
+    "introduction": [                    // Content before first section
+      {
+        "type": "content",
+        "paragraphs": ["Introduction text..."]
+      }
+    ],
+
+    "content": [                           // Main content in reading order
+      {
+        "type": "main_section",          // Major section (Cases, Legislation, etc.)
+        "title": "Cases",
+        "id": "cases",
+        "content": [                     // Sequential array - maintains page order
+          {
+            "type": "content",           // Regular paragraph text
+            "paragraphs": ["Citation format: ..."]
+          },
+          {
+            "type": "example",           // Citation examples (blue arrows)
+            "citation": "Union Carbide v. India, AIR 1990..."
+          },
+          {
+            "type": "table",             // Tables in exact position
+            "headers": ["Reporter", "Date Range", "Format"],
+            "rows": [["All India Reporter", "1914–date", "..."]]
+          },
+          {
+            "type": "subsection",        // Nested subsections
+            "title": "Statutes and Ordinances",
+            "id": "statutes_and_ordinances",
+            "content": [                 // Same sequential structure
+              {"type": "content", "paragraphs": [...]},
+              {"type": "example", "citation": "..."},
+              {"type": "table", "headers": [...], "rows": [...]}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+
+"""
 
 import requests
 from bs4 import BeautifulSoup
@@ -72,269 +127,188 @@ class BluebookScraper:
 
         return metadata
 
-    def is_example_element(self, element):
-        """Check if element contains citation examples"""
-        if not element:
-            return False
+    def extract_formatted_text(self, paragraph):
+        """Extract clean text without formatting markers"""
+        if not paragraph:
+            return ""
 
-        # Check for example class
+        result = clean_text(paragraph.get_text())
+        return result
+
+    def classify_element_type(self, element):
+        """Classify what type of content element this is"""
+        if not element or not hasattr(element, 'name'):
+            return 'unknown'
+
+        # Check for example elements (with blue arrow icon)
         if 'example' in element.get('class', []):
-            return True
-
-        # Check for visual indicators (arrow icons, etc.)
+            return 'example'
         if element.find('svg') and 'fill-blue-200' in str(element):
-            return True
+            return 'example'
 
-        return False
+        # Check for tables
+        if element.name == 'table' or element.find('table'):
+            return 'table'
 
-    def is_table_element(self, element):
-        """Check if element is a table"""
-        return element.name == 'table' or element.find('table') is not None
+        # Check for headers
+        h2 = element.find('h2')
+        if h2:
+            if 'text-3xl' in h2.get('class', []):
+                return 'main_header'
+            elif 'font-bold' in h2.get('class', []):
+                # Check if this is a real subheader or just bold text in content
+                h2_classes = ' '.join(h2.get('class', []))
+                h2_text = clean_text(h2.get_text())
 
-    def extract_table_data(self, table_element):
-        """Extract table data as structured information"""
-        if not table_element:
+                # Real subheaders have specific patterns:
+                # 1. ALL CAPS text (like "STATUTES AND ORDINANCES")
+                # 2. Contains 'uppercase' or 'text-xxxxs' classes
+                if (h2_text.isupper() or
+                    'uppercase' in h2_classes or
+                    'text-xxxxs' in h2_classes or
+                    'tracking-widest' in h2_classes):
+                    return 'sub_header'
+                else:
+                    # This is just bold text within content, not a header
+                    return 'content'
+
+        # Check for content paragraphs
+        if element.find('p', class_='font-serif'):
+            return 'content'
+
+        # Check if it contains text content
+        text = clean_text(element.get_text()) if hasattr(element, 'get_text') else ''
+        if text and len(text) > 5:
+            return 'content'
+
+        return 'unknown'
+
+    def extract_content_data(self, element, element_type):
+        """Extract data based on element type"""
+        if element_type == 'main_header':
+            h2 = element.find('h2', class_='text-3xl')
+            return {
+                'type': 'main_header',
+                'title': clean_text(h2.get_text()) if h2 else '',
+                'id': self.generate_id(clean_text(h2.get_text())) if h2 else ''
+            }
+
+        elif element_type == 'sub_header':
+            h2 = element.find('h2', class_='font-bold')
+            title = clean_text(h2.get_text()) if h2 else ''
+            if title.isupper():
+                title = title.title()
+            return {
+                'type': 'sub_header',
+                'title': title,
+                'id': self.generate_id(title)
+            }
+
+        elif element_type == 'content':
+            # Extract all text content
+            paragraphs = []
+
+            # Try to get from font-serif paragraphs first
+            serif_paras = element.find_all('p', class_='font-serif')
+            if serif_paras:
+                for p in serif_paras:
+                    text = clean_text(p.get_text())
+                    if text and len(text) > 10:
+                        paragraphs.append(text)
+
+            # If no serif paragraphs found, try other paragraph types
+            if not paragraphs:
+                all_paras = element.find_all('p')
+                for p in all_paras:
+                    text = clean_text(p.get_text())
+                    if text and len(text) > 10:
+                        paragraphs.append(text)
+
+            # If still no paragraphs, get direct text from element
+            if not paragraphs:
+                # Skip if this element contains examples or tables to avoid duplication
+                if not element.find('div', class_='example') and not element.find('table'):
+                    text = clean_text(element.get_text())
+                    if text and len(text) > 10:
+                        paragraphs.append(text)
+
+            # Only return if we have actual content
+            if paragraphs:
+                return {
+                    'type': 'content',
+                    'paragraphs': paragraphs
+                }
             return None
 
-        table = table_element if table_element.name == 'table' else table_element.find('table')
-        if not table:
-            return None
-
-        table_data = {
-            'type': 'table',
-            'headers': [],
-            'rows': []
-        }
-
-        # Get headers
-        header_row = table.find('tr')
-        if header_row:
-            headers = header_row.find_all(['th', 'td'])
-            table_data['headers'] = [clean_text(h.get_text()) for h in headers]
-
-        # Get all rows
-        rows = table.find_all('tr')
-        for row in rows[1:]:  # Skip header row
-            cells = row.find_all(['td', 'th'])
-            row_data = [clean_text(cell.get_text()) for cell in cells]
-            if any(cell.strip() for cell in row_data):  # Only add non-empty rows
-                table_data['rows'].append(row_data)
-
-        return table_data
-
-    def extract_examples_from_element(self, element):
-        """Extract citation examples from an element"""
-        examples = []
-
-        if self.is_example_element(element):
-            # This is an example element
+        elif element_type == 'example':
+            # Extract citation example
             content_div = element.find('div', class_='wysiwyg')
             if content_div:
-                example_text = clean_text(content_div.get_text())
-                if example_text:
-                    examples.append({
-                        'text': example_text,
-                        'type': 'citation_example'
-                    })
+                citation = clean_text(content_div.get_text())
+                return {
+                    'type': 'example',
+                    'citation': citation
+                }
+            return None
 
-        # Also check for example elements within this element
-        example_divs = element.find_all('div', class_='example')
-        for example_div in example_divs:
-            content_div = example_div.find('div', class_='wysiwyg')
-            if content_div:
-                example_text = clean_text(content_div.get_text())
-                if example_text:
-                    examples.append({
-                        'text': example_text,
-                        'type': 'citation_example'
-                    })
+        elif element_type == 'table':
+            # Extract table data
+            table = element if element.name == 'table' else element.find('table')
+            if not table:
+                return None
 
-        return examples
+            table_data = {
+                'type': 'table',
+                'headers': [],
+                'rows': []
+            }
 
-    def extract_content_from_element(self, element):
-        """Extract regular content (paragraphs, text) from an element"""
-        content = []
+            # Get headers from first row
+            first_row = table.find('tr')
+            if first_row:
+                headers = first_row.find_all(['th', 'td'])
+                table_data['headers'] = [clean_text(h.get_text()) for h in headers]
 
-        # Skip if this is an example or table
-        if self.is_example_element(element) or self.is_table_element(element):
-            return content
+            # Get all data rows
+            rows = table.find_all('tr')[1:]  # Skip header row
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                row_data = [clean_text(cell.get_text()) for cell in cells]
+                if any(cell.strip() for cell in row_data):  # Only non-empty rows
+                    table_data['rows'].append(row_data)
 
-        # Extract paragraph content
-        paragraphs = element.find_all('p', class_='font-serif')
-        for p in paragraphs:
-            text = clean_text(p.get_text())
-            if text and len(text) > 10:  # Ignore very short text
-                content.append(text)
+            return table_data
 
-        # If no paragraphs found, try to get text directly
-        if not content:
-            # Get text but skip examples and tables
-            for child in element.children:
-                if hasattr(child, 'name'):
-                    if not self.is_example_element(child) and not self.is_table_element(child):
-                        text = clean_text(child.get_text()) if hasattr(child, 'get_text') else clean_text(str(child))
-                        if text and len(text) > 10:
-                            content.append(text)
-                elif isinstance(child, str):
-                    text = clean_text(child)
-                    if text and len(text) > 10:
-                        content.append(text)
-
-        return content
-
-    def process_section_content(self, section_element, next_section_element=None):
-        """Process all content between a section header and the next section"""
-        section_data = {
-            'content': [],
-            'examples': [],
-            'tables': [],
-            'subsections': []
-        }
-
-        current = section_element
-        while current:
-            current = current.find_next_sibling()
-
-            # Stop if we hit the next major section or end of content
-            if not current:
-                break
-            if next_section_element and current == next_section_element:
-                break
-            if current.find('h2', class_='text-3xl'):
-                break
-
-            # Check for subsection header
-            subsection_header = current.find('h2', class_='font-bold')
-            if subsection_header:
-                subsection_title = clean_text(subsection_header.get_text())
-                if subsection_title:
-                    # Process subsection content
-                    subsection_data = self.process_subsection_content(current)
-                    subsection_data['title'] = subsection_title
-                    subsection_data['id'] = self.generate_id(subsection_title)
-                    section_data['subsections'].append(subsection_data)
-                continue
-
-            # Extract different types of content
-            content = self.extract_content_from_element(current)
-            section_data['content'].extend(content)
-
-            examples = self.extract_examples_from_element(current)
-            section_data['examples'].extend(examples)
-
-            if self.is_table_element(current):
-                table_data = self.extract_table_data(current)
-                if table_data:
-                    section_data['tables'].append(table_data)
-
-        return section_data
-
-    def process_subsection_content(self, subsection_element):
-        """Process content within a subsection"""
-        subsection_data = {
-            'content': [],
-            'examples': [],
-            'tables': []
-        }
-
-        # Get content from the subsection element itself
-        content = self.extract_content_from_element(subsection_element)
-        subsection_data['content'].extend(content)
-
-        examples = self.extract_examples_from_element(subsection_element)
-        subsection_data['examples'].extend(examples)
-
-        if self.is_table_element(subsection_element):
-            table_data = self.extract_table_data(subsection_element)
-            if table_data:
-                subsection_data['tables'].append(table_data)
-
-        # Look at following siblings until next subsection or section
-        current = subsection_element
-        while current:
-            current = current.find_next_sibling()
-
-            if not current:
-                break
-
-            # Stop at next subsection or major section
-            if current.find('h2', class_='font-bold') or current.find('h2', class_='text-3xl'):
-                break
-
-            content = self.extract_content_from_element(current)
-            subsection_data['content'].extend(content)
-
-            examples = self.extract_examples_from_element(current)
-            subsection_data['examples'].extend(examples)
-
-            if self.is_table_element(current):
-                table_data = self.extract_table_data(current)
-                if table_data:
-                    subsection_data['tables'].append(table_data)
-
-        return subsection_data
+        return None
 
     def generate_id(self, title):
         """Generate a clean ID from title"""
         if not title:
             return 'untitled'
 
-        # Clean and normalize
         id_str = title.lower()
         id_str = re.sub(r'[^\w\s-]', '', id_str)
         id_str = re.sub(r'[-\s]+', '_', id_str)
         return id_str.strip('_')
 
-    def extract_introduction(self, soup):
-        """Extract introduction content before first major section"""
-        introduction = {
-            'content': [],
-            'examples': []
-        }
+    def process_sequential_content(self, main_content_div):
+        """Process content in sequential order as it appears on page"""
+        content_structure = []
+        current_section = None
+        current_subsection = None
 
-        # Find the first major section
-        first_section = soup.find('h2', class_='text-3xl')
-        if not first_section:
-            return introduction
+        # Find all major section headers first to establish boundaries
+        section_headers = main_content_div.find_all('h2', class_='text-3xl')
+        section_boundaries = {}
 
-        # Look for content before the first section
-        main_content = soup.find('div', class_='leading-0')
-        if not main_content:
-            return introduction
-
-        # Process elements before first section
-        for element in main_content.find_all(['div', 'p']):
-            # Stop when we reach the first section
-            if element.find('h2', class_='text-3xl'):
-                break
-
-            content = self.extract_content_from_element(element)
-            introduction['content'].extend(content)
-
-            examples = self.extract_examples_from_element(element)
-            introduction['examples'].extend(examples)
-
-        return introduction
-
-    def parse_content(self, html):
-        """Parse HTML content into textbook-like structure"""
-        soup = BeautifulSoup(html, 'lxml')
-        self.logger.info("Parsing content in textbook format...")
-
-        # Extract metadata
-        metadata = self.extract_document_metadata(soup)
-
-        # Initialize structure
-        self.data = {
-            'document': {
-                **metadata,
-                'introduction': self.extract_introduction(soup),
-                'sections': []
+        for i, header in enumerate(section_headers):
+            section_title = clean_text(header.get_text())
+            next_header = section_headers[i + 1] if i + 1 < len(section_headers) else None
+            section_boundaries[section_title] = {
+                'start': header.parent,
+                'end': next_header.parent if next_header else None
             }
-        }
 
-        # Find all major sections (h2 with text-3xl class)
-        section_headers = soup.find_all('h2', class_='text-3xl')
         self.logger.info(f"Found {len(section_headers)} major sections")
 
         for i, header in enumerate(section_headers):
@@ -344,30 +318,138 @@ class BluebookScraper:
 
             self.logger.info(f"Processing section: {section_title}")
 
-            # Get the next section for boundary detection
-            next_header = section_headers[i + 1] if i + 1 < len(section_headers) else None
-
-            # Process section content
-            section_content = self.process_section_content(
-                header.parent,
-                next_header.parent if next_header else None
-            )
-
-            section_data = {
-                'id': self.generate_id(section_title),
+            # Start new main section
+            current_section = {
+                'type': 'main_section',
                 'title': section_title,
-                'order': i + 1,
-                **section_content
+                'id': self.generate_id(section_title),
+                'content': []  # This will be the sequential array
             }
 
-            self.data['document']['sections'].append(section_data)
+            # Process all elements after this section header until next section
+            current_element = header.parent
+            section_end = section_boundaries[section_title]['end']
 
-        self.logger.info(f"Parsing complete with {len(self.data['document']['sections'])} sections")
+            while current_element:
+                current_element = current_element.find_next_sibling()
+
+                # Stop if we hit the next section or end of content
+                if not current_element or current_element == section_end:
+                    break
+
+                # Process this element in order
+                self.process_element_sequentially(current_element, current_section)
+
+            content_structure.append(current_section)
+
+        return content_structure
+
+    def process_element_sequentially(self, element, current_section):
+        """Process a single element and add it to the sequential content array"""
+        element_type = self.classify_element_type(element)
+
+        if element_type == 'unknown':
+            return
+
+        # Check if this is a subsection header
+        if element_type == 'sub_header':
+            extracted_data = self.extract_content_data(element, element_type)
+            if extracted_data:
+                # Start new subsection
+                subsection = {
+                    'type': 'subsection',
+                    'title': extracted_data['title'],
+                    'id': extracted_data['id'],
+                    'content': []  # Sequential array for subsection content
+                }
+                current_section['content'].append(subsection)
+            return
+
+        # Extract the content data
+        extracted_data = self.extract_content_data(element, element_type)
+        if not extracted_data:
+            # Debug: log when content extraction fails
+            if element_type == 'content':
+                element_text = clean_text(element.get_text())[:100]
+                self.logger.debug(f"Content extraction failed for element with text: {element_text}")
+            return
+
+        # Debug: log successful extractions
+        if element_type == 'content' and extracted_data.get('paragraphs'):
+            self.logger.debug(f"Extracted {len(extracted_data['paragraphs'])} paragraphs")
+
+        # Add to the appropriate sequential content array
+        # If we have subsections, add to the last subsection, otherwise add to main section
+        if (current_section['content'] and
+            current_section['content'][-1].get('type') == 'subsection'):
+            # Add to last subsection
+            current_section['content'][-1]['content'].append(extracted_data)
+        else:
+            # Add directly to main section
+            current_section['content'].append(extracted_data)
+
+    def extract_introduction_content(self, soup):
+        """Extract introduction content before first main section"""
+        introduction_content = []
+
+        # Find main content area
+        main_content = soup.find('div', class_='leading-0')
+        if not main_content:
+            return introduction_content
+
+        # Find first main section header
+        first_section = main_content.find('h2', class_='text-3xl')
+
+        if first_section:
+            # Get all elements before first section
+            for element in main_content.find_all(['div', 'p']):
+                # Stop when we reach first section
+                if element == first_section.parent or element.find('h2', class_='text-3xl'):
+                    break
+
+                element_type = self.classify_element_type(element)
+                if element_type in ['content', 'example']:
+                    extracted_data = self.extract_content_data(element, element_type)
+                    if extracted_data:
+                        introduction_content.append(extracted_data)
+
+        return introduction_content
+
+    def parse_content(self, html):
+        """Parse HTML content maintaining sequential order"""
+        soup = BeautifulSoup(html, 'lxml')
+        self.logger.info("Parsing content in sequential order...")
+
+        # Extract metadata
+        metadata = self.extract_document_metadata(soup)
+
+        # Find main content area
+        main_content = soup.find('div', class_='leading-0')
+        if not main_content:
+            self.logger.error("Could not find main content area")
+            return
+
+        # Extract introduction
+        introduction = self.extract_introduction_content(soup)
+
+        # Process all content sequentially
+        sequential_content = self.process_sequential_content(main_content)
+
+        # Build final structure
+        self.data = {
+            'document': {
+                **metadata,
+                'introduction': introduction,
+                'content': sequential_content
+            }
+        }
+
+        self.logger.info(f"Parsing complete with {len(sequential_content)} main sections")
 
     def save_results(self):
         """Save scraped data to files"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_file = OUTPUT_DIR / f"bluebook_textbook_{timestamp}.json"
+        json_file = OUTPUT_DIR / f"bluebook_sequential_{timestamp}.json"
 
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
@@ -383,7 +465,7 @@ class BluebookScraper:
 
     def run(self):
         """Main scraping workflow"""
-        self.logger.info("Starting generic textbook scraper...")
+        self.logger.info("Starting sequential textbook scraper...")
 
         try:
             self.setup_driver()
@@ -393,7 +475,7 @@ class BluebookScraper:
                 self.logger.error("Failed to fetch page. Exiting.")
                 return None
 
-            save_html(html, "bluebook_textbook_rendered.html")
+            save_html(html, "bluebook_sequential_rendered.html")
             self.parse_content(html)
             return self.save_results()
 
