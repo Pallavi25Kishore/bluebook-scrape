@@ -17,6 +17,7 @@ git clone [your-repo-url]
 cd bluebook-scraper
 
 pip install -r requirements.txt
-
-python src/scraper.py
+python3 -m venv venv
+source venv/bin/activate
+python -m src.scraper
 ```
