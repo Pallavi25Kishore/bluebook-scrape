@@ -389,31 +389,49 @@ class BluebookScraper:
             current_section['content'].append(extracted_data)
 
     def extract_introduction_content(self, soup):
-        """Extract introduction content before first main section"""
-        introduction_content = []
+      """Extract introduction content before first main section"""
+      introduction_content = []
 
-        # Find main content area
-        main_content = soup.find('div', class_='leading-0')
-        if not main_content:
-            return introduction_content
+      # Find main content area
+      main_content = soup.find('div', class_='leading-0')
+      if not main_content:
+          return introduction_content
 
-        # Find first main section header
-        first_section = main_content.find('h2', class_='text-3xl')
+      # Find the div that contains the actual content
+      content_div = main_content.find('div', class_='m-auto max-w-72ch pt-22 md:pt-24.5 pb-32')
+      if not content_div:
+          return introduction_content
 
-        if first_section:
-            # Get all elements before first section
-            for element in main_content.find_all(['div', 'p']):
-                # Stop when we reach first section
-                if element == first_section.parent or element.find('h2', class_='text-3xl'):
-                    break
+      # Get all direct children of the content div
+      children = list(content_div.children)
 
-                element_type = self.classify_element_type(element)
-                if element_type in ['content', 'example']:
-                    extracted_data = self.extract_content_data(element, element_type)
-                    if extracted_data:
-                        introduction_content.append(extracted_data)
+      # Look through children for introduction content
+      for child in children:
+          if not hasattr(child, 'name') or not child.name:
+              continue
 
-        return introduction_content
+          # Stop if we hit a section
+          if child.get('id', '').startswith('b-'):
+              break
+
+          # Look for div with class 'relative' that contains wysiwyg
+          if child.name == 'div' and 'relative' in child.get('class', []):
+              # Look for wysiwyg div inside
+              wysiwyg = child.find('div', class_='wysiwyg')
+              if wysiwyg:
+                  # Get all text from the wysiwyg div
+                  all_text = wysiwyg.get_text(strip=True)
+                  cleaned_text = clean_text(all_text)
+
+                  if cleaned_text and len(cleaned_text) > 10:
+                      introduction_content.append({
+                          'type': 'content',
+                          'paragraphs': [cleaned_text]
+                      })
+                      self.logger.info(f"Found introduction: {cleaned_text[:50]}...")
+                      return introduction_content
+
+      return introduction_content
 
     def parse_content(self, html):
         """Parse HTML content maintaining sequential order"""
